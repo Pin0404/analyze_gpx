@@ -1,0 +1,650 @@
+import gpxpy
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+import json
+import math
+from scipy.interpolate import interp1d, UnivariateSpline
+from scipy.ndimage import median_filter, gaussian_filter1d
+from sklearn.cluster import DBSCAN
+from geopy.distance import geodesic
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+class GPXProcessor:
+    def __init__(self, gpx_directory):
+        self.gpx_directory = gpx_directory
+        self.raw_tracks = {}
+        self.cleaned_tracks = {}
+        self.resampled_tracks = {}
+        self.standard_route = None
+        self.track_alignments = {}
+        self.rest_points = {}
+        
+    def run_complete_analysis(self):
+        """執行完整的GPX分析流程"""
+        print("=== GPX軌跡分析開始 ===")
+        
+        # Step 1: 載入數據
+        print("Step 1: 載入GPX檔案...")
+        self.load_all_gpx_files()
+        
+        # Step 2: 清理數據
+        print("Step 2: 清理軌跡數據...")
+        self.clean_all_tracks()
+        
+        # Step 3: 重新採樣
+        print("Step 3: 距離基準重新採樣...")
+        self.resample_all_tracks()
+        
+        # Step 4: 建立標準路線
+        print("Step 4: 建立標準路線...")
+        self.create_standard_route()
+        
+        # Step 5: 軌跡對應
+        print("Step 5: 計算軌跡對應...")
+        self.align_all_tracks()
+        
+        # Step 6: 檢測休息點
+        print("Step 6: 檢測休息點...")
+        self.detect_all_rest_points()
+        
+        # Step 7: 生成報告和地圖
+        print("Step 7: 生成分析報告...")
+        self.generate_reports()
+        
+        # Step 8: 生成互動地圖
+        print("Step 8: 生成互動地圖...")
+        self.generate_interactive_map()
+        
+        print("=== 分析完成 ===")
+
+    def load_all_gpx_files(self):
+        """載入所有GPX檔案"""
+        gpx_files = [f for f in os.listdir(self.gpx_directory) if f.endswith('.gpx')]
+        
+        for filename in gpx_files:
+            try:
+                filepath = os.path.join(self.gpx_directory, filename)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    gpx = gpxpy.parse(f)
+                    self.raw_tracks[filename] = self.extract_track_points(gpx)
+                    print(f"載入: {filename} - {len(self.raw_tracks[filename])} 個點")
+            except Exception as e:
+                print(f"載入失敗 {filename}: {e}")
+
+    def extract_track_points(self, gpx):
+        """從GPX物件提取軌跡點"""
+        points = []
+        for track in gpx.tracks:
+            for segment in track.segments:
+                for point in segment.points:
+                    points.append({
+                        'lat': point.latitude,
+                        'lon': point.longitude,
+                        'elevation': point.elevation if point.elevation else 0,
+                        'time': point.time
+                    })
+        return pd.DataFrame(points)
+
+    def clean_all_tracks(self):
+        """清理所有軌跡數據"""
+        for filename, df in self.raw_tracks.items():
+            if len(df) > 0:
+                cleaned_df = self.clean_single_track(df)
+                if len(cleaned_df) > 10:  # 至少保留10個點
+                    self.cleaned_tracks[filename] = cleaned_df
+                    print(f"清理: {filename} - 保留 {len(cleaned_df)}/{len(df)} 個點")
+
+    def clean_single_track(self, df):
+        """清理單一軌跡"""
+        # 移除重複時間點
+        df = df.drop_duplicates(subset=['time']).reset_index(drop=True)
+        
+        # 按時間排序
+        if 'time' in df.columns:
+            df = df.sort_values('time').reset_index(drop=True)
+        
+        # 計算移動距離和速度
+        df['distance'] = self.calculate_distances(df)
+        df['speed'] = self.calculate_speeds(df)
+        
+        # 移除異常速度點 (>50 km/h)
+        speed_threshold = 50
+        df = df[df['speed'] < speed_threshold].reset_index(drop=True)
+        
+        # 移除高度異常點 (突變超過200m)
+        if len(df) > 2:
+            elevation_diff = np.abs(np.diff(df['elevation']))
+            valid_indices = np.concatenate([[True], elevation_diff < 200])
+            df = df[valid_indices].reset_index(drop=True)
+        
+        return df
+
+    def calculate_distances(self, df):
+        """計算相鄰點間距離"""
+        distances = [0]
+        for i in range(1, len(df)):
+            dist = geodesic(
+                (df.iloc[i-1]['lat'], df.iloc[i-1]['lon']),
+                (df.iloc[i]['lat'], df.iloc[i]['lon'])
+            ).meters
+            distances.append(dist)
+        return distances
+
+    def calculate_speeds(self, df):
+        """計算移動速度 (km/h)"""
+        speeds = [0]
+        for i in range(1, len(df)):
+            if df.iloc[i]['time'] and df.iloc[i-1]['time']:
+                time_diff = (df.iloc[i]['time'] - df.iloc[i-1]['time']).total_seconds()
+                if time_diff > 0:
+                    speed = (df.iloc[i]['distance'] / time_diff) * 3.6  # m/s to km/h
+                    speeds.append(min(speed, 100))  # 限制最大速度
+                else:
+                    speeds.append(0)
+            else:
+                speeds.append(0)
+        return speeds
+
+    def resample_all_tracks(self):
+        """對所有軌跡進行距離基準重新採樣"""
+        interval = 8  # 8米間隔
+        
+        for filename, df in self.cleaned_tracks.items():
+            try:
+                resampled_df = self.resample_by_distance(df, interval)
+                if len(resampled_df) > 5:
+                    self.resampled_tracks[filename] = resampled_df
+                    print(f"重採樣: {filename} - {len(resampled_df)} 個點")
+            except Exception as e:
+                print(f"重採樣失敗 {filename}: {e}")
+
+    def resample_by_distance(self, df, interval):
+        """以固定距離間隔重新採樣"""
+        # 計算累積距離
+        df['cumulative_distance'] = np.cumsum(df['distance'])
+        
+        # 創建新的距離採樣點
+        max_distance = df['cumulative_distance'].iloc[-1]
+        new_distances = np.arange(0, max_distance, interval)
+        
+        # 對各維度進行插值
+        result_data = {'cumulative_distance': new_distances}
+        
+        for column in ['lat', 'lon', 'elevation']:
+            if len(df) > 3:
+                # 使用線性插值
+                f = interp1d(df['cumulative_distance'], df[column], 
+                           kind='linear', fill_value='extrapolate')
+                interpolated = f(new_distances)
+                
+                # 對經緯度進行輕微平滑
+                if column in ['lat', 'lon']:
+                    interpolated = gaussian_filter1d(interpolated, sigma=0.5)
+                # 對高度進行中位數濾波
+                elif column == 'elevation':
+                    if len(interpolated) > 5:
+                        interpolated = median_filter(interpolated, size=3)
+                
+                result_data[column] = interpolated
+        
+        return pd.DataFrame(result_data)
+
+    def create_standard_route(self):
+        """建立標準路線"""
+        if not self.resampled_tracks:
+            print("沒有可用的重採樣軌跡")
+            return
+        
+        # 合併所有軌跡點
+        all_points = []
+        for filename, df in self.resampled_tracks.items():
+            for _, row in df.iterrows():
+                all_points.append([row['lat'], row['lon'], row['elevation']])
+        
+        all_points = np.array(all_points)
+        
+        # 使用DBSCAN進行空間聚類
+        coords = all_points[:, :2]  # 只用經緯度聚類
+        dbscan = DBSCAN(eps=0.0001, min_samples=3)  # 約10米半徑
+        clusters = dbscan.fit_predict(coords)
+        
+        # 計算聚類中心點
+        standard_points = []
+        cluster_stats = []
+        
+        for cluster_id in set(clusters):
+            if cluster_id != -1:  # 忽略噪音點
+                cluster_mask = clusters == cluster_id
+                cluster_points = all_points[cluster_mask]
+                
+                center_lat = np.mean(cluster_points[:, 0])
+                center_lon = np.mean(cluster_points[:, 1])
+                center_elevation = np.median(cluster_points[:, 2])
+                point_count = len(cluster_points)
+                
+                standard_points.append([center_lat, center_lon, center_elevation])
+                cluster_stats.append(point_count)
+        
+        # 按照地理位置排序（簡單的距離排序）
+        if standard_points:
+            standard_points = np.array(standard_points)
+            
+            # 找到起點（最南或最西的點）
+            start_idx = np.argmin(standard_points[:, 0] + standard_points[:, 1])
+            
+            # 簡單的最近鄰排序
+            ordered_points = [standard_points[start_idx]]
+            remaining_indices = list(range(len(standard_points)))
+            remaining_indices.remove(start_idx)
+            
+            current_point = standard_points[start_idx]
+            while remaining_indices:
+                distances = []
+                for idx in remaining_indices:
+                    dist = geodesic(current_point[:2], standard_points[idx][:2]).meters
+                    distances.append(dist)
+                
+                nearest_idx = remaining_indices[np.argmin(distances)]
+                ordered_points.append(standard_points[nearest_idx])
+                current_point = standard_points[nearest_idx]
+                remaining_indices.remove(nearest_idx)
+            
+            # 建立標準路線DataFrame
+            self.standard_route = pd.DataFrame(ordered_points, 
+                                             columns=['lat', 'lon', 'elevation'])
+            
+            # 計算累積距離
+            distances = [0]
+            for i in range(1, len(self.standard_route)):
+                dist = geodesic(
+                    (self.standard_route.iloc[i-1]['lat'], self.standard_route.iloc[i-1]['lon']),
+                    (self.standard_route.iloc[i]['lat'], self.standard_route.iloc[i]['lon'])
+                ).meters
+                distances.append(distances[-1] + dist)
+            
+            self.standard_route['cumulative_distance'] = distances
+            
+            print(f"標準路線建立完成: {len(self.standard_route)} 個控制點")
+            print(f"總距離: {distances[-1]:.0f} 米")
+
+    def align_all_tracks(self):
+        """將所有軌跡對應到標準路線"""
+        if self.standard_route is None:
+            print("標準路線尚未建立")
+            return
+        
+        for filename, df in self.resampled_tracks.items():
+            alignment = self.align_single_track(df)
+            self.track_alignments[filename] = alignment
+            print(f"對應完成: {filename}")
+
+    def align_single_track(self, track_df):
+        """將單一軌跡對應到標準路線"""
+        alignments = []
+        
+        for idx, row in track_df.iterrows():
+            track_point = (row['lat'], row['lon'])
+            
+            # 找到最近的標準路線點
+            min_distance = float('inf')
+            best_match = None
+            
+            for std_idx, std_row in self.standard_route.iterrows():
+                std_point = (std_row['lat'], std_row['lon'])
+                distance = geodesic(track_point, std_point).meters
+                
+                if distance < min_distance:
+                    min_distance = distance
+                    best_match = {
+                        'standard_route_index': std_idx,
+                        'standard_route_distance': std_row['cumulative_distance'],
+                        'deviation_distance': distance,
+                        'elevation_diff': abs(row['elevation'] - std_row['elevation'])
+                    }
+            
+            alignments.append({
+                'original_index': idx,
+                'lat': row['lat'],
+                'lon': row['lon'],
+                'elevation': row['elevation'],
+                **best_match
+            })
+        
+        return pd.DataFrame(alignments)
+
+    def detect_all_rest_points(self):
+        """檢測所有軌跡的休息點"""
+        for filename, df in self.cleaned_tracks.items():
+            if 'time' in df.columns and len(df) > 10:
+                rest_points = self.detect_rest_points_single_track(df)
+                self.rest_points[filename] = rest_points
+                print(f"休息點檢測: {filename} - 發現 {len(rest_points)} 個休息點")
+
+    def detect_rest_points_single_track(self, df, time_threshold=300, distance_threshold=25):
+        """檢測單一軌跡的休息點"""
+        rest_points = []
+        
+        i = 0
+        while i < len(df) - 5:
+            start_time = df.iloc[i]['time']
+            start_pos = (df.iloc[i]['lat'], df.iloc[i]['lon'])
+            
+            # 找到時間窗口內的點
+            j = i + 1
+            while j < len(df) and (df.iloc[j]['time'] - start_time).total_seconds() < time_threshold:
+                j += 1
+            
+            if j > i + 3:  # 至少要有幾個點
+                # 計算這段時間內的最大移動距離
+                window_df = df.iloc[i:j]
+                max_distance = 0
+                
+                for _, row in window_df.iterrows():
+                    current_pos = (row['lat'], row['lon'])
+                    distance = geodesic(start_pos, current_pos).meters
+                    max_distance = max(max_distance, distance)
+                
+                # 如果移動距離小於閾值，認為是休息點
+                if max_distance < distance_threshold:
+                    duration = (df.iloc[j-1]['time'] - start_time).total_seconds()
+                    
+                    rest_points.append({
+                        'start_time': start_time,
+                        'end_time': df.iloc[j-1]['time'],
+                        'duration': duration,
+                        'lat': start_pos[0],
+                        'lon': start_pos[1],
+                        'elevation': df.iloc[i]['elevation']
+                    })
+                    
+                    i = j  # 跳過這個休息段
+                else:
+                    i += 1
+            else:
+                i += 1
+        
+        return rest_points
+
+    def generate_reports(self):
+        """生成分析報告"""
+        # 1. 標準路線報告
+        if self.standard_route is not None:
+            standard_route_data = {
+                'metadata': {
+                    'total_distance': float(self.standard_route['cumulative_distance'].iloc[-1]),
+                    'elevation_gain': float(self.standard_route['elevation'].max() - self.standard_route['elevation'].min()),
+                    'control_points': len(self.standard_route),
+                    'processing_date': datetime.now().isoformat()
+                },
+                'route_points': []
+            }
+            
+            for idx, row in self.standard_route.iterrows():
+                standard_route_data['route_points'].append({
+                    'sequence': int(idx),
+                    'lat': float(row['lat']),
+                    'lon': float(row['lon']),
+                    'elevation': float(row['elevation']),
+                    'distance_from_start': float(row['cumulative_distance'])
+                })
+            
+            with open('standard_route.json', 'w', encoding='utf-8') as f:
+                json.dump(standard_route_data, f, ensure_ascii=False, indent=2)
+            
+            print("標準路線報告已儲存: standard_route.json")
+        
+        # 2. 軌跡對應報告
+        if self.track_alignments:
+            alignment_records = []
+            for filename, alignment_df in self.track_alignments.items():
+                for _, row in alignment_df.iterrows():
+                    alignment_records.append({
+                        'filename': filename,
+                        'original_point_id': int(row['original_index']),
+                        'standard_route_progress': float(row['standard_route_distance']) / float(self.standard_route['cumulative_distance'].iloc[-1]),
+                        'deviation_distance': float(row['deviation_distance']),
+                        'elevation_diff': float(row['elevation_diff'])
+                    })
+            
+            alignment_df = pd.DataFrame(alignment_records)
+            alignment_df.to_csv('track_alignment.csv', index=False, encoding='utf-8')
+            print("軌跡對應報告已儲存: track_alignment.csv")
+        
+        # 3. 休息點分析報告
+        if self.rest_points:
+            # 找出常見休息點
+            all_rest_locations = []
+            for filename, rest_list in self.rest_points.items():
+                for rest_point in rest_list:
+                    all_rest_locations.append([rest_point['lat'], rest_point['lon'], rest_point['duration']])
+            
+            if all_rest_locations:
+                all_rest_locations = np.array(all_rest_locations)
+                
+                # 對休息點位置進行聚類
+                coords = all_rest_locations[:, :2]
+                dbscan = DBSCAN(eps=0.0002, min_samples=2)  # 約20米半徑
+                clusters = dbscan.fit_predict(coords)
+                
+                common_rest_spots = []
+                for cluster_id in set(clusters):
+                    if cluster_id != -1:
+                        cluster_mask = clusters == cluster_id
+                        cluster_points = all_rest_locations[cluster_mask]
+                        
+                        common_rest_spots.append({
+                            'location_name': f"休息點_{cluster_id + 1}",
+                            'coordinates': [float(np.mean(cluster_points[:, 0])), 
+                                          float(np.mean(cluster_points[:, 1]))],
+                            'frequency': int(len(cluster_points)),
+                            'average_duration': float(np.mean(cluster_points[:, 2]))
+                        })
+                
+                rest_analysis = {
+                    'common_rest_spots': common_rest_spots,
+                    'individual_rest_points': {}
+                }
+                
+                for filename, rest_list in self.rest_points.items():
+                    rest_analysis['individual_rest_points'][filename] = [
+                        {
+                            'start_time': rp['start_time'].isoformat(),
+                            'duration': rp['duration'],
+                            'coordinates': [rp['lat'], rp['lon']],
+                            'elevation': rp['elevation']
+                        } for rp in rest_list
+                    ]
+                
+                with open('rest_analysis.json', 'w', encoding='utf-8') as f:
+                    json.dump(rest_analysis, f, ensure_ascii=False, indent=2)
+                
+                print("休息點分析報告已儲存: rest_analysis.json")
+
+    def generate_interactive_map(self):
+        """使用OpenStreetMap + Leaflet生成互動地圖"""
+        html_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>桃山登山軌跡分析地圖</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <style>
+        #map { height: 800px; }
+        .legend {
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+        }
+        .legend h4 { margin: 0 0 10px 0; }
+        .legend div { margin: 5px 0; }
+        .legend i {
+            width: 18px;
+            height: 18px;
+            float: left;
+            margin-right: 8px;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <h1>桃山登山軌跡分析地圖</h1>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script>
+        // 初始化地圖
+        var map = L.map('map');
+        
+        // 添加OpenStreetMap圖層
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+        
+        // 標準路線數據
+        var standardRoute = {{ standard_route_js }};
+        
+        // 原始軌跡數據
+        var originalTracks = {{ original_tracks_js }};
+        
+        // 休息點數據
+        var restPoints = {{ rest_points_js }};
+        
+        // 添加標準路線
+        if (standardRoute.length > 0) {
+            var standardPolyline = L.polyline(standardRoute, {
+                color: 'red',
+                weight: 4,
+                opacity: 0.8
+            }).addTo(map);
+            
+            // 添加起點和終點標記
+            L.marker(standardRoute[0])
+                .addTo(map)
+                .bindPopup('起點<br>海拔: ' + standardRoute[0][2] + 'm');
+            
+            L.marker(standardRoute[standardRoute.length - 1])
+                .addTo(map)
+                .bindPopup('終點<br>海拔: ' + standardRoute[standardRoute.length - 1][2] + 'm');
+        }
+        
+        // 添加原始軌跡
+        var colors = ['blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 
+                     'beige', 'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 
+                     'white', 'pink', 'lightblue', 'lightgreen', 'gray', 'black', 'lightgray'];
+        
+        var trackIndex = 0;
+        for (var filename in originalTracks) {
+            var track = originalTracks[filename];
+            if (track.length > 0) {
+                L.polyline(track, {
+                    color: colors[trackIndex % colors.length],
+                    weight: 2,
+                    opacity: 0.6
+                }).addTo(map).bindPopup('軌跡: ' + filename);
+                
+                trackIndex++;
+            }
+        }
+        
+        // 添加休息點
+        for (var i = 0; i < restPoints.length; i++) {
+            var rest = restPoints[i];
+            L.circleMarker([rest.lat, rest.lon], {
+                color: 'yellow',
+                fillColor: 'orange',
+                fillOpacity: 0.7,
+                radius: 8
+            }).addTo(map).bindPopup(
+                '休息點<br>' +
+                '頻率: ' + rest.frequency + ' 次<br>' +
+                '平均停留: ' + Math.round(rest.average_duration / 60) + ' 分鐘'
+            );
+        }
+        
+        // 設定地圖視野
+        if (standardRoute.length > 0) {
+            map.fitBounds(standardPolyline.getBounds());
+        }
+        
+        // 添加圖例
+        var legend = L.control({position: 'bottomright'});
+        legend.onAdd = function (map) {
+            var div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = 
+                '<h4>圖例</h4>' +
+                '<div><i style="background:red"></i> 標準路線</div>' +
+                '<div><i style="background:blue"></i> 原始軌跡</div>' +
+                '<div><i style="background:orange; border-radius:50%"></i> 常見休息點</div>';
+            return div;
+        };
+        legend.addTo(map);
+    </script>
+</body>
+</html>
+        """
+        
+        # 準備地圖數據
+        standard_route_coords = []
+        if self.standard_route is not None:
+            for _, row in self.standard_route.iterrows():
+                standard_route_coords.append([float(row['lat']), float(row['lon']), float(row['elevation'])])
+        
+        original_tracks_data = {}
+        for filename, df in self.cleaned_tracks.items():
+            track_coords = []
+            for _, row in df.iterrows():
+                track_coords.append([float(row['lat']), float(row['lon'])])
+            original_tracks_data[filename] = track_coords
+        
+        rest_points_data = []
+        if os.path.exists('rest_analysis.json'):
+            with open('rest_analysis.json', 'r', encoding='utf-8') as f:
+                rest_analysis = json.load(f)
+                rest_points_data = rest_analysis.get('common_rest_spots', [])
+        
+        # 生成HTML
+        html_content = html_template.replace(
+            '{{ standard_route_js }}', json.dumps(standard_route_coords)
+        ).replace(
+            '{{ original_tracks_js }}', json.dumps(original_tracks_data)
+        ).replace(
+            '{{ rest_points_js }}', json.dumps(rest_points_data)
+        )
+        
+        with open('interactive_map.html', 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        print("互動地圖已生成: interactive_map.html")
+
+def main():
+    """主執行函數"""
+    gpx_directory = "."  # 假設GPX檔案在當前目錄
+    
+    # 檢查GPX檔案是否存在
+    gpx_files = [f for f in os.listdir(gpx_directory) if f.endswith('.gpx')]
+    if not gpx_files:
+        print("未找到GPX檔案，請確認檔案位置")
+        return
+    
+    print(f"找到 {len(gpx_files)} 個GPX檔案")
+    
+    # 建立處理器並執行分析
+    processor = GPXProcessor(gpx_directory)
+    processor.run_complete_analysis()
+    
+    print("\n=== 輸出檔案 ===")
+    print("1. standard_route.json - 標準路線數據")
+    print("2. track_alignment.csv - 軌跡對應報告")
+    print("3. rest_analysis.json - 休息點分析")
+    print("4. interactive_map.html - 互動地圖")
+    print("\n開啟 interactive_map.html 檢視地圖結果")
+
+if __name__ == "__main__":
+    main()

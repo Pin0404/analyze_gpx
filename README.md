@@ -28,17 +28,14 @@ analyze_gpx/
 │   │   ├── gpx_kept_list.csv        # 保留檔案清單
 │   │   └── gpx_deleted_list.csv     # 剔除檔案清單
 │   │
-│   ├── 🧹 清理後資料夾
-│   │   ├── Clean_HikingNote_gpx/    # HikingNote 篩選結果
-│   │   └── Clean_HikingBook_gpx/    # HikingBook 篩選結果
+│   ├── Clean_HikingNote_gpx/     # HikingNote 篩選後剩下的 .gpx 資料夾
+│   │   └── xxxx.gpx           
+│   └── Clean_HikingBook_gpx/     # HikingBook 篩選後剩下的 .gpx 資料夾
+│       └── xxxx.gpx           
+│           
+├── GpxClean/                     
 │   │
-│   ├── 🎯 路線過濾系統
-│   │   ├── 分辨有效路線.py           # 桃山步道路線過濾主程式
-│   │   ├── Clean_MustPass_HBHN_gpx/ # 符合桃山單攻條件的路線
-│   │   └── route_analysis_results.txt # 路線分析結果報告
-│   │
-├── 📁 GpxClean/                     # GPX 處理模組
-│   ├── 📓 gpx_clean.ipynb           # GPX → CSV 轉檔及統計腳本
+│   ├── gpx_clean.ipynb           # GPX → CSV & 統計相關腳本
 │   │
 │   ├── 📈 轉檔輸出
 │   │   ├── gpx_to_csv/              # 基本 CSV 檔案
